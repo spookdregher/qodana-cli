@@ -17,319 +17,364 @@
 package platform
 
 import (
-    "encoding/json"
-    "fmt"
-    "github.com/JetBrains/qodana-cli/v2024/sarif"
-    "github.com/google/uuid"
-    sarif2 "github.com/owenrumney/go-sarif/v2/sarif"
-    log "github.com/sirupsen/logrus"
-    "os"
-    "path/filepath"
-    "strings"
-    "time"
+	"encoding/json"
+	"fmt"
+	"github.com/JetBrains/qodana-cli/v2024/sarif"
+	"github.com/google/uuid"
+	sarif2 "github.com/owenrumney/go-sarif/v2/sarif"
+	bbapi "github.com/reviewdog/go-bitbucket"
+	log "github.com/sirupsen/logrus"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 )
 
+// https://www.jetbrains.com/help/qodana/qodana-sarif-output.html
 const (
-    // baselineStateEmpty default baseline state (not set)
-    baselineStateEmpty = ""
-    // baselineStateNew new baseline state
-    baselineStateNew = "new"
-    // baselineStateUnchanged unchanged baseline state
-    baselineStateUnchanged = "unchanged"
-    extension              = ".sarif.json"
+	baselineStateEmpty     = ""          // baselineStateEmpty default baseline state (not set)
+	baselineStateNew       = "new"       // baselineStateNew new baseline state
+	baselineStateUnchanged = "unchanged" // baselineStateUnchanged unchanged baseline state
+	extension              = ".sarif.json"
+	qodanaCritical         = "Critical"
+	qodanaHigh             = "High"
+	qodanaModerate         = "Moderate"
+	qodanaLow              = "Low"
+	qodanaInfo             = "Info"
+	sarifError             = "error"
+	sarifWarning           = "warning"
+	sarifNote              = "note"
 )
 
 func MergeSarifReports(options *QodanaOptions, deviceId string) (int, error) {
-    files, err := findSarifFiles(options.GetTmpResultsDir())
-    if err != nil {
-        return 0, fmt.Errorf("Error locating SARIF files: %s\n", err)
-    }
+	files, err := findSarifFiles(options.GetTmpResultsDir())
+	if err != nil {
+		return 0, fmt.Errorf("Error locating SARIF files: %s\n", err)
+	}
 
-    if len(files) == 0 {
-        return 0, fmt.Errorf("No SARIF files (file names ending with .sarif.json) found in %s\n", options.GetTmpResultsDir())
-    }
+	if len(files) == 0 {
+		return 0, fmt.Errorf("No SARIF files (file names ending with .sarif.json) found in %s\n", options.GetTmpResultsDir())
+	}
 
-    ch := make(chan *sarif.Report)
-    go collectReports(files, ch)
-    finalReport, err := mergeReports(ch)
-    if err != nil {
-        return 0, fmt.Errorf("Error merging SARIF files: %s\n", err)
-    }
+	ch := make(chan *sarif.Report)
+	go collectReports(files, ch)
+	finalReport, err := mergeReports(ch)
+	if err != nil {
+		return 0, fmt.Errorf("Error merging SARIF files: %s\n", err)
+	}
 
-    for _, result := range finalReport.Runs[0].Results {
-        // update locations[].physicalLocation.artifactLocation.uri by removing the projectDir prefix
-        for _, location := range result.Locations {
-            if (location.PhysicalLocation == nil) || (location.PhysicalLocation.ArtifactLocation == nil) {
-                continue
-            }
-            toReplace := options.ProjectDir
-            if !strings.HasSuffix(toReplace, string(os.PathSeparator)) {
-                toReplace += string(os.PathSeparator)
-            }
-            location.PhysicalLocation.ArtifactLocation.Uri = strings.TrimPrefix(location.PhysicalLocation.ArtifactLocation.Uri, toReplace)
-        }
-    }
+	for _, result := range finalReport.Runs[0].Results {
+		// update locations[].physicalLocation.artifactLocation.uri by removing the projectDir prefix
+		for _, location := range result.Locations {
+			if (location.PhysicalLocation == nil) || (location.PhysicalLocation.ArtifactLocation == nil) {
+				continue
+			}
+			toReplace := options.ProjectDir
+			if !strings.HasSuffix(toReplace, string(os.PathSeparator)) {
+				toReplace += string(os.PathSeparator)
+			}
+			location.PhysicalLocation.ArtifactLocation.Uri = strings.TrimPrefix(location.PhysicalLocation.ArtifactLocation.Uri, toReplace)
+		}
+	}
 
-    SetVersionControlParams(options, deviceId, finalReport)
+	SetVersionControlParams(options, deviceId, finalReport)
 
-    totalProblems := len(finalReport.Runs[0].Results)
+	totalProblems := len(finalReport.Runs[0].Results)
 
-    err = WriteReport(options.GetSarifPath(), finalReport)
-    if err != nil {
-        return 0, err
-    }
-    return totalProblems, nil
+	err = WriteReport(options.GetSarifPath(), finalReport)
+	if err != nil {
+		return 0, err
+	}
+	return totalProblems, nil
 }
 
 func WriteReport(path string, finalReport *sarif.Report) error {
-    // serialize object skipping empty fields
-    fatBytes, err := json.MarshalIndent(finalReport, "", " ")
-    if err != nil {
-        return fmt.Errorf("Error marshalling report: %s\n", err)
-    }
+	// serialize object skipping empty fields
+	fatBytes, err := json.MarshalIndent(finalReport, "", " ")
+	if err != nil {
+		return fmt.Errorf("Error marshalling report: %s\n", err)
+	}
 
-    f, err := os.Create(path)
-    if err != nil {
-        return fmt.Errorf("Error creating resulting SARIF file: %s\n", err)
-    }
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("Error creating resulting SARIF file: %s\n", err)
+	}
 
-    defer func(f *os.File) {
-        err := f.Close()
-        if err != nil {
-            fmt.Printf("Error closing resulting SARIF file: %s\n", err)
-        }
-    }(f)
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			fmt.Printf("Error closing resulting SARIF file: %s\n", err)
+		}
+	}(f)
 
-    _, err = f.Write(fatBytes)
-    if err != nil {
-        return fmt.Errorf("Error writing resulting SARIF file: %s\n", err)
-    }
-    return nil
+	_, err = f.Write(fatBytes)
+	if err != nil {
+		return fmt.Errorf("Error writing resulting SARIF file: %s\n", err)
+	}
+	return nil
 }
 
 func MakeShortSarif(sarifPath string, shortSarifPath string) error {
-    report, err := ReadReport(sarifPath)
-    if err != nil {
-        return err
-    }
+	report, err := ReadReport(sarifPath)
+	if err != nil {
+		return err
+	}
 
-    if len(report.Runs) == 0 {
-        return fmt.Errorf("error reading SARIF %s: no runs found", sarifPath)
-    }
-    report.Runs[0].Tool.Extensions = []sarif.ToolComponent{}
-    report.Runs[0].Tool.Driver.Taxa = []sarif.ReportingDescriptor{}
-    report.Runs[0].Tool.Driver.Rules = []sarif.ReportingDescriptor{}
-    report.Runs[0].Results = []sarif.Result{}
-    report.Runs[0].Artifacts = []sarif.Artifact{}
-    return WriteReport(shortSarifPath, report)
+	if len(report.Runs) == 0 {
+		return fmt.Errorf("error reading SARIF %s: no runs found", sarifPath)
+	}
+	report.Runs[0].Tool.Extensions = []sarif.ToolComponent{}
+	report.Runs[0].Tool.Driver.Taxa = []sarif.ReportingDescriptor{}
+	report.Runs[0].Tool.Driver.Rules = []sarif.ReportingDescriptor{}
+	report.Runs[0].Results = []sarif.Result{}
+	report.Runs[0].Artifacts = []sarif.Artifact{}
+	return WriteReport(shortSarifPath, report)
 }
 
 func SetVersionControlParams(options *QodanaOptions, deviceId string, finalReport *sarif.Report) {
-    linterOptions := options.GetLinterSpecificOptions()
-    if linterOptions == nil {
-        log.Errorf("Error getting linter-specific options")
-        return
-    }
-    linterInfo := (*linterOptions).GetInfo(options)
-    vcd, err := GetVersionDetails(options.ProjectDir)
-    if err != nil {
-        log.Errorf("Error getting version control details: %s. Project is probably outside of the Git VCS.", err)
-    } else {
-        finalReport.Runs[0].VersionControlProvenance = make([]sarif.VersionControlDetails, 0)
-        finalReport.Runs[0].VersionControlProvenance = append(finalReport.Runs[0].VersionControlProvenance, vcd)
-    }
+	linterOptions := options.GetLinterSpecificOptions()
+	if linterOptions == nil {
+		log.Errorf("Error getting linter-specific options")
+		return
+	}
+	linterInfo := (*linterOptions).GetInfo(options)
+	vcd, err := GetVersionDetails(options.ProjectDir)
+	if err != nil {
+		log.Errorf("Error getting version control details: %s. Project is probably outside of the Git VCS.", err)
+	} else {
+		finalReport.Runs[0].VersionControlProvenance = make([]sarif.VersionControlDetails, 0)
+		finalReport.Runs[0].VersionControlProvenance = append(finalReport.Runs[0].VersionControlProvenance, vcd)
+	}
 
-    if deviceId != "" {
-        finalReport.Runs[0].Properties = &sarif.PropertyBag{}
-        finalReport.Runs[0].Properties.AdditionalProperties = map[string]interface{}{
-            "deviceId": deviceId,
-        }
-    }
+	if deviceId != "" {
+		finalReport.Runs[0].Properties = &sarif.PropertyBag{}
+		finalReport.Runs[0].Properties.AdditionalProperties = map[string]interface{}{
+			"deviceId": deviceId,
+		}
+	}
 
-    if linterInfo.ProductCode != "" {
-        finalReport.Runs[0].Tool.Driver.Name = linterInfo.ProductCode
-    }
-    if linterInfo.LinterName != "" {
-        finalReport.Runs[0].Tool.Driver.FullName = linterInfo.LinterName
-    }
-    if linterInfo.LinterVersion != "" {
-        finalReport.Runs[0].Tool.Driver.Version = linterInfo.LinterVersion
-    }
+	if linterInfo.ProductCode != "" {
+		finalReport.Runs[0].Tool.Driver.Name = linterInfo.ProductCode
+	}
+	if linterInfo.LinterName != "" {
+		finalReport.Runs[0].Tool.Driver.FullName = linterInfo.LinterName
+	}
+	if linterInfo.LinterVersion != "" {
+		finalReport.Runs[0].Tool.Driver.Version = linterInfo.LinterVersion
+	}
 
-    finalReport.Runs[0].AutomationDetails = &sarif.RunAutomationDetails{
-        Guid: RunGUID(),
-        Id:   ReportId(linterInfo.ProductCode),
-        Properties: &sarif.PropertyBag{
-            AdditionalProperties: map[string]interface{}{
-                "jobUrl": JobUrl(),
-            },
-        },
-    }
+	finalReport.Runs[0].AutomationDetails = &sarif.RunAutomationDetails{
+		Guid: RunGUID(),
+		Id:   ReportId(linterInfo.ProductCode),
+		Properties: &sarif.PropertyBag{
+			AdditionalProperties: map[string]interface{}{
+				"jobUrl": JobUrl(),
+			},
+		},
+	}
 }
 
 func findSarifFiles(root string) ([]string, error) {
-    var files []string
-    err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return err
-        }
-        if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), extension) {
-            files = append(files, path)
-        }
-        return nil
-    })
-    if err != nil {
-        return nil, err
-    }
-    return files, nil
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), extension) {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 func collectReports(files []string, ch chan<- *sarif.Report) {
-    for _, file := range files {
-        r, err := ReadReport(file)
-        if err != nil {
-            fmt.Printf("Error reading SARIF %s: %s\n", file, err)
-            continue
-        }
-        ch <- r
-    }
-    close(ch)
+	for _, file := range files {
+		r, err := ReadReport(file)
+		if err != nil {
+			fmt.Printf("Error reading SARIF %s: %s\n", file, err)
+			continue
+		}
+		ch <- r
+	}
+	close(ch)
 }
 
 func ReadReport(file string) (*sarif.Report, error) {
-    f, err := os.Open(file)
-    if err != nil {
-        return nil, err
-    }
-    defer func(f *os.File) {
-        err := f.Close()
-        if err != nil {
-            fmt.Printf("Error closing SARIF file %s: %s\n", file, err)
-        }
-    }(f)
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			fmt.Printf("Error closing SARIF file %s: %s\n", file, err)
+		}
+	}(f)
 
-    dec := json.NewDecoder(f)
-    var r sarif.Report
-    if err := dec.Decode(&r); err != nil {
-        return nil, err
-    }
+	dec := json.NewDecoder(f)
+	var r sarif.Report
+	if err := dec.Decode(&r); err != nil {
+		return nil, err
+	}
 
-    return &r, nil
+	return &r, nil
 }
 
 func mergeReports(ch <-chan *sarif.Report) (*sarif.Report, error) {
-    var finalReport *sarif.Report
+	var finalReport *sarif.Report
 
-    for r := range ch {
-        if finalReport == nil {
-            // For the first file, keep the toolDesc configuration and initialize the 'Runs' slice
-            finalReport = &sarif.Report{
-                Schema:  r.Schema,
-                Version: r.Version,
-                Runs:    make([]sarif.Run, 0, len(r.Runs)),
-            }
-            finalReport.Runs = append(finalReport.Runs, r.Runs[0])
-            finalReport.Runs[0].Results = r.Runs[0].Results
-            finalReport.Runs[0].Tool = r.Runs[0].Tool
-            continue
-        }
+	for r := range ch {
+		if finalReport == nil {
+			// For the first file, keep the toolDesc configuration and initialize the 'Runs' slice
+			finalReport = &sarif.Report{
+				Schema:  r.Schema,
+				Version: r.Version,
+				Runs:    make([]sarif.Run, 0, len(r.Runs)),
+			}
+			finalReport.Runs = append(finalReport.Runs, r.Runs[0])
+			finalReport.Runs[0].Results = r.Runs[0].Results
+			finalReport.Runs[0].Tool = r.Runs[0].Tool
+			continue
+		}
 
-        // Append results from each report into the 'Results' slice of the first run of the final report
-        for _, run := range r.Runs {
-            finalReport.Runs[0].Results = append(finalReport.Runs[0].Results, run.Results...)
-            finalReport.Runs[0].Artifacts = append(finalReport.Runs[0].Artifacts, run.Artifacts...)
-        }
-    }
+		// Append results from each report into the 'Results' slice of the first run of the final report
+		for _, run := range r.Runs {
+			finalReport.Runs[0].Results = append(finalReport.Runs[0].Results, run.Results...)
+			finalReport.Runs[0].Artifacts = append(finalReport.Runs[0].Artifacts, run.Artifacts...)
+		}
+	}
 
-    return finalReport, nil
+	return finalReport, nil
 }
 
 func RunGUID() string {
-    runGUID := os.Getenv("QODANA_AUTOMATION_GUID")
-    if runGUID == "" {
-        runGUID = uuid.New().String()
-    }
-    return runGUID
+	runGUID := os.Getenv("QODANA_AUTOMATION_GUID")
+	if runGUID == "" {
+		runGUID = uuid.New().String()
+	}
+	return runGUID
 }
 
 func ReportId(projectName string) string {
-    reportId := os.Getenv("QODANA_REPORT_ID")
-    if reportId != "" {
-        return reportId
-    }
+	reportId := os.Getenv("QODANA_REPORT_ID")
+	if reportId != "" {
+		return reportId
+	}
 
-    projectId := os.Getenv("QODANA_PROJECT_ID")
-    if projectId == "" {
-        projectId = projectName
-    }
+	projectId := os.Getenv("QODANA_PROJECT_ID")
+	if projectId == "" {
+		projectId = projectName
+	}
 
-    date := time.Now().Format("2006-01-02")
-    tool := "qodana"
+	date := time.Now().Format("2006-01-02")
+	tool := "qodana"
 
-    return projectId + "/" + tool + "/" + date
+	return projectId + "/" + tool + "/" + date
 }
 
 func JobUrl() string {
-    return os.Getenv("QODANA_JOB_URL")
+	return os.Getenv("QODANA_JOB_URL")
 }
 
 // ProcessSarif concludes the result of analysis based on provided SARIF file
-// can print problems to the output
-// can create GitLab CodeQuality issues report
-// TODO: can submit problems to BitBucket Code Insights
-func ProcessSarif(sarifPath string, analysisId string, printProblems bool, codeClimate bool, codeInsights bool) {
-    newProblems := 0
-    s, err := sarif2.Open(sarifPath)
-    if err != nil {
-        log.Fatal(err)
-    }
-    var codeClimateIssues []CCIssue
-    var codeInsightIssues []BBAnnotation
-    if printProblems {
-        EmptyMessage()
-    }
-    for _, run := range s.Runs {
-        for _, r := range run.Results {
-            ruleId := *r.RuleID
-            message := *r.Message.Text
-            level := *r.Level
-            baselineState := baselineStateEmpty
-            if r.BaselineState != nil {
-                baselineState = *r.BaselineState
-            }
-            if baselineState == baselineStateNew || baselineState == baselineStateEmpty {
-                newProblems++
-            }
-            if len(r.Locations) > 0 && baselineState != baselineStateUnchanged {
-                if codeClimate {
-                    codeClimateIssues = append(codeClimateIssues, sarifResultToCodeClimate(r))
-                }
-                if codeInsights {
-                    codeInsightIssues = append(codeInsightIssues, sarifResultToBitBucketAnnotation(r))
-                }
-                if printProblems {
-                    printSarifProblem(r, ruleId, level, message)
-                }
-            }
-        }
-    }
-    if codeClimate {
-        err = writeGlCodeQualityReport(codeClimateIssues, sarifPath)
-        if err != nil {
-            log.Warnf("Problems writing GitLab CodeQuality report: %v", err)
-        }
-    }
-    if codeInsights {
-        err = sendBitBucketReport(codeInsightIssues, analysisId)
-        if err != nil {
-            log.Warnf("Problems sending BitBucket Code Insights report: %v", err)
-        }
-    }
-    if !IsContainer() {
-        if newProblems == 0 {
-            SuccessMessage("It seems all right 👌 No new problems found according to the checks applied")
-        } else {
-            ErrorMessage("Found %d new problems according to the checks applied", newProblems)
-        }
-    }
+// - can print problems to the output
+// - can create GitLab CodeQuality issues report
+// - can submit problems to BitBucket Code Insights
+func ProcessSarif(sarifPath, analysisId, reportUrl string, printProblems, codeClimate, codeInsights bool) {
+	newProblems := 0
+	s, err := sarif2.Open(sarifPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var codeClimateIssues []CCIssue
+	var codeInsightIssues []bbapi.ReportAnnotation
+	if printProblems {
+		EmptyMessage()
+	}
+	for _, run := range s.Runs {
+		for _, r := range run.Results {
+			ruleId := *r.RuleID
+			message := *r.Message.Text
+			level := *r.Level
+			baselineState := baselineStateEmpty
+			if r.BaselineState != nil {
+				baselineState = *r.BaselineState
+			}
+			if baselineState == baselineStateNew || baselineState == baselineStateEmpty {
+				newProblems++
+			}
+			if len(r.Locations) > 0 && baselineState != baselineStateUnchanged {
+				if codeClimate {
+					codeClimateIssues = append(codeClimateIssues, sarifResultToCodeClimate(r))
+				}
+				if codeInsights {
+					codeInsightIssues = append(codeInsightIssues, buildAnnotation(r, reportUrl))
+				}
+				if printProblems {
+					printSarifProblem(r, ruleId, level, message)
+				}
+			}
+		}
+	}
+	if codeClimate {
+		err = writeGlCodeQualityReport(codeClimateIssues, sarifPath)
+		if err != nil {
+			log.Warnf("Problems writing GitLab CodeQuality report: %v", err)
+		}
+	}
+	if codeInsights {
+		err = sendBitBucketReport(codeInsightIssues, *s.Runs[0].Tool.Driver.FullName, reportUrl, "qodana-"+analysisId)
+		if err != nil {
+			log.Warnf("Problems sending BitBucket Code Insights report: %v", err)
+		}
+	}
+	if !IsContainer() {
+		if newProblems == 0 {
+			SuccessMessage("It seems all right 👌 No new problems found according to the checks applied")
+		} else {
+			ErrorMessage("Found %d new problems according to the checks applied", newProblems)
+		}
+	}
+}
+
+// getFingerprint returns the fingerprint of the Qodana (or not) SARIF result.
+func getFingerprint(r *sarif2.Result) string {
+	if r == nil || r.PartialFingerprints == nil {
+		log.Debug("nil result object passed to getFingerprint function")
+		return RunGUID()
+	}
+
+	fingerprint, ok := r.PartialFingerprints["equalIndicator/v2"].(string)
+	if !ok {
+		log.Debug("failed to get fingerprint from partial fingerprints v2")
+		fingerprint, ok = r.PartialFingerprints["equalIndicator/v1"].(string)
+		if !ok {
+			log.Debug("failed to get fingerprint from partial fingerprints v1")
+			return RunGUID()
+		}
+	}
+	return fingerprint
+}
+
+// getSeverity returns the severity of the Qodana (or not) SARIF result.
+func getSeverity(r *sarif2.Result) string {
+	if r == nil {
+		log.Debug("nil result object passed to getSeverity function")
+		return sarifNote
+	}
+	if r.Properties == nil && r.Level == nil {
+		log.Debug("nil properties object passed to getSeverity function")
+		return sarifNote
+	}
+
+	severity, ok := r.Properties["qodanaSeverity"].(string)
+	if !ok && r.Level != nil {
+		log.Debug("failed to get severity from properties, using sarif level")
+		severity = *r.Level
+	}
+	return severity
 }

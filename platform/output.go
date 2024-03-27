@@ -245,7 +245,7 @@ func printSarifProblem(r *sarif.Result, ruleId string, level string, message str
 	if r.Locations[0].PhysicalLocation != nil {
 		printProblem(
 			ruleId,
-			level,
+			getSeverity(r),
 			message,
 			*r.Locations[0].PhysicalLocation.ArtifactLocation.URI,
 			*r.Locations[0].PhysicalLocation.Region.StartLine,
@@ -256,7 +256,7 @@ func printSarifProblem(r *sarif.Result, ruleId string, level string, message str
 	} else {
 		printProblem(
 			ruleId,
-			level,
+			getSeverity(r),
 			message,
 			"",
 			0,
